@@ -1,6 +1,6 @@
-cabal-version:       2.4
+cabal-version:       3.0
 name:                selective-prob
-version:             0.0.0.0
+version:             0.1.0.0
 synopsis:            See README for more info
 description:         See README for more info
 homepage:            https://github.com/bolt12/selective-prob
@@ -21,6 +21,12 @@ source-repository head
 
 common common-options
   build-depends:       base ^>= 4.13.0.0
+                       , selective
+                       , vector
+                       , mwc-probability
+                       , async
+                       , containers
+                       , deepseq
   
   ghc-options:         -Wall
                        -Wcompat
@@ -43,6 +49,7 @@ library
   import:              common-options
   hs-source-dirs:      src
   exposed-modules:     SelectiveProb
+                       ConcurrentProb
 
 test-suite selective-prob-test
   import:              common-options
@@ -59,7 +66,7 @@ benchmark selective-prob-benchmark
   type:                exitcode-stdio-1.0
   hs-source-dirs:      benchmark
   main-is:             Main.hs
-  build-depends:       gauge
+  build-depends:       criterion
                      , selective-prob
   ghc-options:         -threaded
                        -rtsopts

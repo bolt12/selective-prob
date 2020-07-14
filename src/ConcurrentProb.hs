@@ -12,20 +12,17 @@ See README for more info
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE RankNTypes #-}
 
-module SelectiveProb where
+module ConcurrentProb where
 
 import Control.Concurrent
 import Control.Concurrent.Async
 import Control.DeepSeq
 import Control.Selective
-import Control.Selective.Free
 import Data.Bifunctor
 import Data.Bool
-import Data.Foldable (toList)
-import Data.Functor.Identity
+import Data.List (group, sort)
+import Data.Foldable (toList, traverse_)
 import Data.IORef
-import Data.List (group, maximumBy, sort)
-import Data.Ord
 import qualified Data.Vector as V
 import Data.Sequence (Seq, singleton)
 import GHC.Generics
@@ -118,6 +115,29 @@ fetch = mapConcurrently_ aux
             a <- MWCP.sample (MWCP.gamma x y) c
             writeIORef ref (Fetched . f $ a)
 
+fetch2 :: [BlockedRequest] -> IO ()
+fetch2 = traverse_ aux
+  where
+    aux (BlockedRequest r ref) = do
+        threadDelay 100
+        c <- MWCP.createSystemRandom
+        case r of
+          Uniform l f -> do
+            i <- MWCP.sample (MWCP.uniformR (0, length l - 1)) c
+            writeIORef ref (Fetched . f $ l !! i)
+          Categorical l f -> do
+            i <- MWCP.sample (MWCP.categorical (V.fromList . map snd $ l)) c
+            writeIORef ref (Fetched . f . fst $ l !! i)
+          Normal x y f -> do
+            a <- MWCP.sample (MWCP.normal x y) c
+            writeIORef ref (Fetched . f $ a)
+          Beta x y f -> do
+            a <- MWCP.sample (MWCP.beta x y) c
+            writeIORef ref (Fetched . f $ a)
+          Gamma x y f -> do
+            a <- MWCP.sample (MWCP.gamma x y) c
+            writeIORef ref (Fetched . f $ a)
+
 runFetch :: Fetch a -> IO a
 runFetch (Fetch h) = do
   r <- h
@@ -127,50 +147,57 @@ runFetch (Fetch h) = do
       fetch (toList br)
       runFetch cont
 
+runFetch2 :: Fetch a -> IO a
+runFetch2 (Fetch h) = do
+  r <- h
+  case r of
+    Done a -> return a
+    Blocked br cont -> do
+      fetch2 (toList br)
+      runFetch2 cont
+
 -- Probabilistic eDSL
 
-type Dist a = Select Request a
+uniform :: [a] -> Fetch a
+uniform = requestSample . flip Uniform id
 
-uniform :: [a] -> Dist a
-uniform = liftSelect . flip Uniform id
+categorical :: [(a, Double)] -> Fetch a
+categorical = requestSample . flip Categorical id
 
-categorical :: [(a, Double)] -> Dist a
-categorical = liftSelect . flip Categorical id
+normal :: Double -> Double -> Fetch Double
+normal x y = requestSample (Normal x y id)
 
-normal :: Double -> Double -> Dist Double
-normal x y = liftSelect (Normal x y id)
-
-bernoulli :: Double -> Dist Bool
+bernoulli :: Double -> Fetch Bool
 bernoulli x = categorical [(True, x), (False, 1 - x)]
 
-binomial :: Int -> Double -> Dist Int
+binomial :: Int -> Double -> Fetch Int
 binomial n p = length . filter id <$> sequenceA (replicate n (bernoulli p))
 
-beta :: Double -> Double -> Dist Double
-beta x y = liftSelect (Beta x y id)
+beta :: Double -> Double -> Fetch Double
+beta x y = requestSample (Beta x y id)
 
-gamma :: Double -> Double -> Dist Double
-gamma x y = liftSelect (Gamma x y id)
+gamma :: Double -> Double -> Fetch Double
+gamma x y = requestSample (Gamma x y id)
 
-condition :: (a -> Bool) -> Dist a -> Dist (Maybe a)
+condition :: (a -> Bool) -> Fetch a -> Fetch (Maybe a)
 condition c = condS (pure c) (pure (const Nothing)) (pure Just)
 
 -- Examples of Probabilistic Programs
 
-ex1a :: Dist (Bool, Bool)
+ex1a :: Fetch (Bool, Bool)
 ex1a =
   let c1 = bernoulli 0.5
       c2 = bernoulli 0.5
    in (,) <$> c1 <*> c2
 
-ex1b :: Dist (Maybe (Bool, Bool))
+ex1b :: Fetch (Maybe (Bool, Bool))
 ex1b =
   let c1 = bernoulli 0.5
       c2 = bernoulli 0.5
       result = (,) <$> c1 <*> c2
    in condition (uncurry (||)) result
 
-ex2 :: Dist Int
+ex2 :: Fetch Int
 ex2 =
   let count = pure 0
       c1 = bernoulli 0.5
@@ -180,7 +207,7 @@ ex2 =
       count3 = ifS (maybe False snd <$> cond) count2 ((+ 1) <$> count2)
    in count3
 
-ex3 :: Dist Int
+ex3 :: Fetch Int
 ex3 =
   let count = pure 0
       c1 = bernoulli 0.5
@@ -190,7 +217,7 @@ ex3 =
       count3 = ifS c2 count2 ((+ 1) <$> count2)
    in ifS cond count3 ((+) <$> count3 <*> ex3)
 
-ex4 :: Dist Bool
+ex4 :: Fetch Bool
 ex4 =
   let b = pure True
       c = bernoulli 0.5
@@ -200,21 +227,21 @@ data Coin = Heads | Tails
   deriving (Show, Eq, Ord, Bounded, Enum, NFData, Generic)
 
 -- Throw 2 coins
-t2c :: Dist (Coin, Coin)
+t2c :: Fetch (Coin, Coin)
 t2c =
   let c1 = bool Heads Tails <$> bernoulli 0.5
       c2 = bool Heads Tails <$> bernoulli 0.5
    in (,) <$> c1 <*> c2
 
 -- Throw 2 coins with condition
-t2c2 :: Dist (Maybe (Bool, Bool))
+t2c2 :: Fetch (Maybe (Bool, Bool))
 t2c2 =
   let c1 = bernoulli 0.5
       c2 = bernoulli 0.5
    in condition (uncurry (||)) ((,) <$> c1 <*> c2)
 
 -- | Throw coins until 'Heads' comes up
-prog :: Dist [Coin]
+prog :: Fetch [Coin]
 prog =
   let toss = bernoulli 0.5
    in condS
@@ -224,7 +251,7 @@ prog =
         (bool Heads Tails <$> toss)
 
 -- | bad toss
-throw :: Int -> Dist [Bool]
+throw :: Int -> Fetch [Bool]
 throw 0 = pure []
 throw n =
   let toss = bernoulli 0.5
@@ -238,7 +265,7 @@ throw n =
 -- the face of the third dice is equal to the other dice,
 -- otherwise the third die is thrown and one piece moves
 -- the number of squares equal to the sum of all the dice.
-diceThrow :: Dist Int
+diceThrow :: Fetch Int
 diceThrow =
   condS
     (pure $ uncurry (==))
@@ -246,7 +273,7 @@ diceThrow =
     (pure (\(a, _) -> a + a + a))
     ((,) <$> die <*> die) -- Parallel dice throw
 
-diceThrow2 :: Dist [Int]
+diceThrow2 :: Fetch [Int]
 diceThrow2 =
   condS
     (pure $ uncurry (==))
@@ -254,13 +281,13 @@ diceThrow2 =
     (pure (\(a, b) -> [a, b]))
     ((,) <$> die <*> die) -- Parallel dice throw
 
-die :: Dist Int
+die :: Fetch Int
 die = uniform [1 .. 6]
 
 -- | Infering the weight of a coin.
 --
 -- The coin is fair with probability 0.8 and biased with probability 0.2.
-weight :: Dist Prob
+weight :: Fetch Prob
 weight =
   ifS
     (bernoulli 0.8)
@@ -269,17 +296,17 @@ weight =
 
 -- Sampling/Inference Algorithms
 
-sample :: Dist a -> Int -> Dist [a]
+sample :: Fetch a -> Int -> Fetch [a]
 sample r n = sequenceA (replicate n r)
 
 -- monte carlo sampling/inference
-monteCarlo :: Ord a => Int -> Dist a -> Dist [(a, Double)]
+monteCarlo :: Ord a => Int -> Fetch a -> Fetch [(a, Double)]
 monteCarlo n d =
   let r = sample d n
    in map (\l -> (head l, fromIntegral (length l) / fromIntegral n)) . group . sort <$> r
 
 -- Inefficient rejection sampling
-rejection :: (Bounded c, Enum c, Eq c) => ([a] -> [b] -> Bool) -> [b] -> Dist c -> (c -> Dist a) -> Dist c
+rejection :: (Bounded c, Enum c, Eq c) => ([a] -> [b] -> Bool) -> [b] -> Fetch c -> (c -> Fetch a) -> Fetch c
 rejection predicate observed proposal model = loop
   where
     len = length observed
@@ -291,66 +318,6 @@ rejection predicate observed proposal model = loop
             cond
             parameters
             loop
-
--- forward sampling
-runToIO :: Dist a -> IO a
-runToIO = runSelect interpret
-  where
-    interpret (Uniform l f) = do
-      threadDelay 100
-      c <- MWCP.createSystemRandom
-      i <- MWCP.sample (MWCP.uniformR (0, length l - 1)) c
-      return (f $ l !! i)
-    interpret (Categorical l f) = do
-      threadDelay 100
-      c <- MWCP.createSystemRandom
-      i <- MWCP.sample (MWCP.categorical (V.fromList . map snd $ l)) c
-      return (f . fst $ l !! i)
-    interpret (Normal x y f) = do
-      threadDelay 100
-      c <- MWCP.createSystemRandom
-      f <$> MWCP.sample (MWCP.normal x y) c
-    interpret (Beta x y f) = do
-      threadDelay 100
-      c <- MWCP.createSystemRandom
-      f <$> MWCP.sample (MWCP.beta x y) c
-    interpret (Gamma x y f) = do
-      threadDelay 100
-      c <- MWCP.createSystemRandom
-      f <$> MWCP.sample (MWCP.gamma x y) c
-
-runToFetch :: Dist a -> Fetch a
-runToFetch = runSelect requestSample
-
-runToIO2 :: Dist a -> IO a
-runToIO2 = runFetch . runToFetch
-
-distMean :: Dist a -> a
-distMean = runIdentity . runSelect interpret
-  where
-    interpret (Uniform l f) = Identity . f . (!! meanIndex) $ l
-      where
-        meanIndex = (length l - 1) `div` 2
-    -- There's no sensible mean, so I just return the most probable value
-    interpret (Categorical l f) = Identity . f . fst . (!! maxi) $ l
-      where
-        maxi = snd $ maximumBy (comparing fst) (zip (map snd l) [0 ..])
-    interpret (Normal x _ f) = Identity $ f x
-    interpret (Beta x _ f) = Identity $ f x
-    interpret (Gamma x _ f) = Identity $ f x
-
-distStandardDeviation :: Dist a -> a
-distStandardDeviation = runIdentity . runSelect interpret
-  where
-    interpret (Uniform l f) = Identity . f . (!! stdIndex) $ l
-      where
-        stdIndex = round . sqrt $ ((fromIntegral (length l) ^ 2) - 1) / 12
-    interpret (Categorical _ _) = error "No sensible value"
-    interpret (Normal _ y f) = Identity $ f y
-    interpret (Beta _ y f) = Identity $ f y
-    interpret (Gamma _ y f) = Identity $ f y
-
--- Selective Applicative Functor utilities
 
 -- Guard function used in McCarthy's conditional
 
@@ -372,3 +339,4 @@ grdS f a = selector <$> applyF f (dup <$> a)
 -- operator and benefits from a series of properties and laws.
 condS :: Selective f => f (b -> Bool) -> f (b -> c) -> f (b -> c) -> f b -> f c
 condS p f g = (\r -> branch r f g) . grdS p
+
